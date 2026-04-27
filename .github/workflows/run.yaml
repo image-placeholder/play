@@ -308,8 +308,8 @@ jobs:
           DATASET="${{ github.event.inputs.dataset }}"
           OUT_NAME="model_${MODEL}_${DATASET}.bin"
 
-          python export.py out/ckpt.pt --version 1 --hf
-          mv out/model.bin "out/${OUT_NAME}"
+          # Use --checkpoint because we are exporting the local result of train.py
+          python export.py "out/${OUT_NAME}" --version 1 --checkpoint out/ckpt.pt
 
           echo "── Exported artifact ──────────────────────────────────────"
           ls -lh out/
