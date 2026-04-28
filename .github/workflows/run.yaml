@@ -214,10 +214,14 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "DEBUG: locating .bin files"
-          find . -name "*.bin"
-          git add -f $(find . -name "*.bin") || true
+          echo "Files in output:"
+          ls -lh llama2.c/out/
+          # Only add model outputs (NOT dataset)
+          git add -f llama2.c/out/*.bin
+          git status
           if ! git diff --cached --quiet; then
             git commit -m "Add trained model: ${{ github.event.inputs.model }}"
-            git push
+            git push origin HEAD:${{ github.ref_name }}
+          else
+            echo "No changes to commit"
           fi
