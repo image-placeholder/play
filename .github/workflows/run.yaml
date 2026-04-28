@@ -302,6 +302,8 @@ jobs:
 
 
       # ── 6. Export to .bin ───────────────────────────────────────────────
+
+ 
       - name: Export checkpoint to llama2.c v1 .bin
         run: |
           cd llama2.c
@@ -309,7 +311,19 @@ jobs:
           DATASET="${{ github.event.inputs.dataset }}"
           OUT_NAME="model_${MODEL}_${DATASET}.bin"
 
-          python export.py "out/${OUT_NAME}" --version 1 --checkpoint out/ckpt.pt
+          echo "── Listing out/ dir ───────────────────────────────────────"
+          ls -lh out/ || echo "out/ does not exist"
+
+          echo "── Finding any .pt files ──────────────────────────────────"
+          find . -name "*.pt" 2>/dev/null || echo "No .pt files found"
+
+          CKPT="out/ckpt.pt"
+          if [ ! -f "$CKPT" ]; then
+            echo "ERROR: checkpoint not found at $CKPT"
+            exit 1
+          fi
+
+          python export.py "out/${OUT_NAME}" --version 1 --checkpoint "$CKPT"
 
           echo "── Exported artifact ──────────────────────────────────────"
           ls -lh out/
