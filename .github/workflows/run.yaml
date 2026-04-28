@@ -217,7 +217,6 @@ jobs:
           echo "Copying outputs out of nested repo..."
           mkdir -p model_out
           cp llama2.c/out/*.bin model_out/
-          cp llama2.c/out/ckpt.pt model_out/
           git add model_out/
           git status
           if ! git diff --cached --quiet; then
