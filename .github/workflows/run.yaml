@@ -308,7 +308,7 @@ jobs:
           DATASET="${{ github.event.inputs.dataset }}"
           OUT_NAME="model_${MODEL}_${DATASET}.bin"
 
-          python export.py out/ckpt.pt --version 1
+          python export.py out/ckpt.pt --version 1 --hf
           mv out/model.bin "out/${OUT_NAME}"
 
           echo "── Exported artifact ──────────────────────────────────────"
@@ -333,6 +333,7 @@ jobs:
           for await (const tok of ullm.generate('Task: explain_code\nInput: '))
             process.stdout.write(tok);
           EOF
+
 
       # ------------------------------------------------------------------
       # 9. Upload artifact
