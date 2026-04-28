@@ -1,3 +1,16 @@
+# .github/workflows/train_tiny_llm.yml
+# Trains a tiny Llama-2 architecture model via karpathy/llama2.c,
+# exports to llama2.c v1 .bin (float32 LE) — ullm / aarossig/ullm compatible.
+#
+# MODEL PRESETS  (model input):
+#   nano   →  ~1 M params  — Wii / MCU (primary aarossig/ullm target)
+#   micro  →  ~4 M params  — embedded Linux / browser via ullm.js
+#   mini   → ~15 M params  — richer output, still CPU-tractable
+#
+# DATASET PRESETS  (dataset input):
+#   tinystories  → roneneldan/TinyStories (default)
+#   explain_code → code_search_net Python, prompt-formatted
+
 name: Train Tiny LLM
 
 on:
@@ -9,15 +22,18 @@ on:
         required: true
         type: choice
         options: [nano, micro, mini]
+
       dataset:
         description: "Dataset: tinystories | explain_code"
         default: "tinystories"
         required: true
         type: choice
         options: [tinystories, explain_code]
+
       iters:
         description: "Training iterations (0 = use preset default)"
         default: "0"
+
       resume:
         description: "Resume from checkpoint?"
         default: "false"
@@ -30,6 +46,7 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      # ── 1. Repo + Python ────────────────────────────────────────────────
       - name: Checkout repo
         uses: actions/checkout@v4
 
@@ -41,15 +58,19 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
+          # Pin numpy<2 — PyTorch 2.x compiled against NumPy 1.x ABI
           pip install "numpy<2"
+          # torch>=2.4 required by modern transformers; cpu-only wheel
           pip install "torch>=2.4.0" --index-url https://download.pytorch.org/whl/cpu
           pip install sentencepiece tqdm requests "datasets>=2.19" "transformers>=4.40"
 
+      # ── 2. Clone llama2.c ───────────────────────────────────────────────
       - name: Clone karpathy/llama2.c
         run: |
           git clone --depth 1 https://github.com/karpathy/llama2.c.git
           echo "llama2.c @ $(git -C llama2.c rev-parse --short HEAD)"
 
+      # ── 3a. TinyStories dataset ─────────────────────────────────────────
       - name: Cache TinyStories dataset
         if: github.event.inputs.dataset == 'tinystories'
         uses: actions/cache@v4
@@ -72,59 +93,92 @@ jobs:
             echo "Pretokenization cached — skipping."
           fi
 
+      # ── 3b. explain_code dataset ────────────────────────────────────────
       - name: Cache explain_code dataset
         if: github.event.inputs.dataset == 'explain_code'
         uses: actions/cache@v4
         with:
           path: llama2.c/data/TinyStories_all_data
+          # key includes a hash of the builder script so cache busts on changes
           key: explain-code-pretok-v3
 
       - name: Build + pretokenize explain_code dataset
         if: github.event.inputs.dataset == 'explain_code'
         run: |
+          # We place the shards inside TinyStories_all_data/ so the stock
+          # tinystories.py Task loader finds them without any patching.
           python - << 'PYEOF'
           import os, json, pathlib
           import numpy as np
           from datasets import load_dataset
-          import sentencepiece as spm
-          import urllib.request
 
-          OUT_DIR = pathlib.Path("llama2.c/data/TinyStories_all_data")
+          # ── destination: where tinystories.py looks by default ──────────
+          OUT_DIR    = pathlib.Path("llama2.c/data/TinyStories_all_data")
           OUT_DIR.mkdir(parents=True, exist_ok=True)
 
+          # Skip if already built (cache hit)
           existing = sorted(OUT_DIR.glob("data*.bin"))
           if existing:
-              print(f"Cache hit — {len(existing)} shard(s) present, skipping build.")
+              print(f"Cache hit — {len(existing)} shard(s) already present, skipping build.")
               raise SystemExit(0)
 
-          SHARD_SIZE = 8_000_000
-          MAX_SEQ    = 480
+          SHARD_SIZE = 8_000_000   # tokens per shard
+          MAX_SEQ    = 480         # truncate long sequences
           BOS, EOS   = 1, 2
 
+          # ── Tokenizer ────────────────────────────────────────────────────
+          # Use sentencepiece directly with the tokenizer.model that
+          # tinystories.py download already placed at data/tok32000/
+          # Fall back to the HF llama-tokenizer mirror if not found.
+          import sentencepiece as spm
+
+          tok_candidates = [
+              "llama2.c/tokenizer.model",
+              "llama2.c/data/tok32000/tokenizer.model",
+          ]
           sp = None
-          for tc in ["llama2.c/tokenizer.model", "llama2.c/data/tok32000/tokenizer.model"]:
+          for tc in tok_candidates:
               if pathlib.Path(tc).exists():
                   sp = spm.SentencePieceProcessor()
                   sp.Load(tc)
                   print(f"Loaded tokenizer from {tc}")
                   break
+
           if sp is None:
+              # Download tokenizer.model from a public mirror
+              import urllib.request
+              tok_url = (
+                  "https://huggingface.co/hf-internal-testing/"
+                  "llama-tokenizer/resolve/main/tokenizer.model"
+              )
               tok_path = pathlib.Path("llama2.c/tokenizer.model")
-              urllib.request.urlretrieve(
-                  "https://huggingface.co/hf-internal-testing/llama-tokenizer/resolve/main/tokenizer.model",
-                  tok_path)
+              print(f"Downloading tokenizer.model from {tok_url} …")
+              urllib.request.urlretrieve(tok_url, tok_path)
               sp = spm.SentencePieceProcessor()
               sp.Load(str(tok_path))
+              print("Tokenizer loaded.")
 
-          ds = load_dataset("code_search_net", "python", split="train", trust_remote_code=True)
-          print(f"Loaded {len(ds):,} examples")
+          def encode(text):
+              return sp.encode(text, out_type=int)
 
-          shard_idx, shard_toks, total_toks, n_written = 0, [], 0, 0
+          # ── Load dataset ─────────────────────────────────────────────────
+          print("Loading code_search_net (Python) …")
+          ds = load_dataset(
+              "code_search_net", "python",
+              split="train", trust_remote_code=True)
+          print(f"  {len(ds):,} examples")
+
+          # ── Tokenize + write shards ───────────────────────────────────────
+          shard_idx   = 0
+          shard_toks  = []
+          total_toks  = 0
+          n_written   = 0
 
           def flush(toks, idx):
-              arr = np.array(toks, dtype=np.uint16)
-              arr.tofile(str(OUT_DIR / f"data{idx:02d}.bin"))
-              print(f"  shard {idx:02d}: {len(arr):,} tokens")
+              arr  = np.array(toks, dtype=np.uint16)
+              path = OUT_DIR / f"data{idx:02d}.bin"
+              arr.tofile(str(path))
+              print(f"  shard {idx:02d}: {len(arr):,} tokens → {path}")
               return idx + 1
 
           for ex in ds:
@@ -135,119 +189,155 @@ jobs:
               summary = doc.split("\n")[0].split(".")[0].strip()
               if len(summary) < 8:
                   summary = doc[:150].strip()
-              text = f"Task: explain_code\nInput: {code[:600]}\nOutput: {summary}"
-              ids = sp.encode(text, out_type=int)
+
+              text = (
+                  f"Task: explain_code\n"
+                  f"Input: {code[:600]}\n"
+                  f"Output: {summary}"
+              )
+              ids = encode(text)
               seq = [BOS] + list(ids[:MAX_SEQ]) + [EOS]
               shard_toks.extend(seq)
               total_toks += len(seq)
               n_written  += 1
+
               if len(shard_toks) >= SHARD_SIZE:
                   shard_idx  = flush(shard_toks, shard_idx)
                   shard_toks = []
+
           if shard_toks:
               shard_idx = flush(shard_toks, shard_idx)
 
-          (OUT_DIR / "meta.json").write_text(json.dumps(
-              {"examples": n_written, "total_tokens": total_toks, "shards": shard_idx}))
-          print(f"Done: {n_written:,} examples, {total_toks:,} tokens, {shard_idx} shards")
+          meta = {"examples": n_written, "total_tokens": total_toks,
+                  "shards": shard_idx, "vocab_size": 32000}
+          (OUT_DIR / "meta.json").write_text(json.dumps(meta, indent=2))
+          print(f"\n✓  {n_written:,} examples  {total_toks:,} tokens  {shard_idx} shards")
           PYEOF
 
+      # ── 4. Write train_config.py ────────────────────────────────────────
       - name: Write train_config.py
+        run: |
+          python - << 'PYEOF'
+          import os, pathlib
+
+          model   = os.environ["MODEL"]
+          dataset = os.environ["DATASET"]
+          iters   = int(os.environ.get("ITERS", "0"))
+          resume  = os.environ.get("RESUME", "false").lower() == "true"
+
+          PRESETS = {
+              "nano":  dict(dim=64,  n_layers=4, n_heads=4, n_kv_heads=4,
+                            hidden_dim=128, seq_len=256,
+                            bs=32, ga=1, lr=8e-4, iters=300, eval=100, warm=50),
+              "micro": dict(dim=128, n_layers=5, n_heads=4, n_kv_heads=4,
+                            hidden_dim=256, seq_len=256,
+                            bs=32, ga=2, lr=5e-4, iters=600, eval=200, warm=100),
+              "mini":  dict(dim=288, n_layers=6, n_heads=6, n_kv_heads=6,
+                            hidden_dim=768, seq_len=256,
+                            bs=16, ga=4, lr=3e-4, iters=1000, eval=250, warm=100),
+          }
+          p = PRESETS.get(model, PRESETS["micro"])
+          max_iters = iters if iters > 0 else p["iters"]
+
+          # tinystories.py Task always looks under DATA_CACHE_DIR/TinyStories_all_data
+          # for vocab_source=llama2, so dataset config value is just "data"
+          cfg = f"""\
+          # model={model}  dataset={dataset}  iters={max_iters}
+          dim            = {p["dim"]}
+          n_layers       = {p["n_layers"]}
+          n_heads        = {p["n_heads"]}
+          n_kv_heads     = {p["n_kv_heads"]}
+          multiple_of    = 32
+          max_seq_len    = {p["seq_len"]}
+
+          max_iters                   = {max_iters}
+          batch_size                  = {p["bs"]}
+          gradient_accumulation_steps = {p["ga"]}
+          learning_rate               = {p["lr"]}
+          warmup_iters                = {p["warm"]}
+          lr_decay_iters              = {max_iters}
+          min_lr                      = {p["lr"] * 0.1}
+          weight_decay                = 0.1
+          grad_clip                   = 1.0
+          beta1                       = 0.9
+          beta2                       = 0.95
+
+          eval_interval           = {p["eval"]}
+          log_interval            = 10
+          eval_iters              = 20
+          eval_only               = False
+          always_save_checkpoint  = True
+
+          out_dir    = "out"
+          init_from  = "{'resume' if resume else 'scratch'}"
+
+          dataset      = "data"
+          vocab_source = "llama2"
+          vocab_size   = 32000
+
+          device  = "cpu"
+          dtype   = "float32"
+          compile = False
+          """
+          # de-indent (heredoc adds leading spaces)
+          import textwrap
+          cfg = textwrap.dedent(cfg)
+
+          out = pathlib.Path("llama2.c/train_config.py")
+          out.write_text(cfg)
+          print(f"Config written → {out}")
+          print(cfg)
+          PYEOF
         env:
           MODEL:   ${{ github.event.inputs.model }}
           DATASET: ${{ github.event.inputs.dataset }}
           ITERS:   ${{ github.event.inputs.iters }}
           RESUME:  ${{ github.event.inputs.resume }}
-        run: |
-          python - << 'PYEOF'
-          import os, pathlib, textwrap
 
-          model  = os.environ["MODEL"]
-          iters  = int(os.environ.get("ITERS", "0"))
-          resume = os.environ.get("RESUME", "false").lower() == "true"
-
-          PRESETS = {
-              "nano":  dict(dim=64,  n_layers=4, n_heads=4, n_kv_heads=4, hidden_dim=128, seq_len=256, bs=32, ga=1, lr=8e-4, iters=300, eval=100, warm=50),
-              "micro": dict(dim=128, n_layers=5, n_heads=4, n_kv_heads=4, hidden_dim=256, seq_len=256, bs=32, ga=2, lr=5e-4, iters=600, eval=200, warm=100),
-              "mini":  dict(dim=288, n_layers=6, n_heads=6, n_kv_heads=6, hidden_dim=768, seq_len=256, bs=16, ga=4, lr=3e-4, iters=1000, eval=250, warm=100),
-          }
-          p = PRESETS.get(model, PRESETS["micro"])
-          max_iters = iters if iters > 0 else p["iters"]
-
-          cfg = textwrap.dedent(f"""
-              dim            = {p["dim"]}
-              n_layers       = {p["n_layers"]}
-              n_heads        = {p["n_heads"]}
-              n_kv_heads     = {p["n_kv_heads"]}
-              multiple_of    = 32
-              max_seq_len    = {p["seq_len"]}
-              max_iters                   = {max_iters}
-              batch_size                  = {p["bs"]}
-              gradient_accumulation_steps = {p["ga"]}
-              learning_rate               = {p["lr"]}
-              warmup_iters                = {p["warm"]}
-              lr_decay_iters              = {max_iters}
-              min_lr                      = {p["lr"] * 0.1}
-              weight_decay                = 0.1
-              grad_clip                   = 1.0
-              beta1                       = 0.9
-              beta2                       = 0.95
-              eval_interval           = {min(p["eval"], max_iters // 2)}
-              log_interval            = 10
-              eval_iters              = 20
-              eval_only               = False
-              always_save_checkpoint  = True
-              out_dir    = "out"
-              init_from  = "{'resume' if resume else 'scratch'}"
-              dataset      = "data"
-              vocab_source = "llama2"
-              vocab_size   = 32000
-              device  = "cpu"
-              dtype   = "float32"
-              compile = False
-          """).strip()
-
-          pathlib.Path("llama2.c/train_config.py").write_text(cfg)
-          print(cfg)
-          PYEOF
-
+      # ── 5. Train ────────────────────────────────────────────────────────
       - name: Train model
         run: |
           cd llama2.c
           python train.py train_config.py
 
-      - name: Export checkpoint to .bin
+
+      # ── 6. Export to .bin ───────────────────────────────────────────────
+      - name: Export checkpoint to llama2.c v1 .bin
         run: |
           cd llama2.c
-
-          echo "=== Searching for checkpoints ==="
-          find . -name "*.pt" -o -name "*.pth" 2>/dev/null | sort
-          echo "=== Contents of out/ ==="
-          ls -lh out/ 2>/dev/null || echo "out/ does not exist"
-
-          # Find the checkpoint — train.py writes out/ckpt.pt but let's be safe
-          CKPT=""
-          for candidate in out/ckpt.pt out/model.pt ckpt.pt; do
-            if [ -f "$candidate" ]; then
-              CKPT="$candidate"
-              echo "Found checkpoint: $CKPT"
-              break
-            fi
-          done
-
-          if [ -z "$CKPT" ]; then
-            echo "ERROR: No checkpoint found. Training may have failed or not saved."
-            exit 1
-          fi
-
-          python export.py out/model.bin --version 1 --checkpoint "$CKPT"
-
           MODEL="${{ github.event.inputs.model }}"
           DATASET="${{ github.event.inputs.dataset }}"
-          mv out/model.bin "out/model_${MODEL}_${DATASET}.bin"
+          OUT_NAME="model_${MODEL}_${DATASET}.bin"
+
+          python export.py "out/${OUT_NAME}" --version 1 --checkpoint out/ckpt.pt
+
+          echo "── Exported artifact ──────────────────────────────────────"
           ls -lh out/
 
-          
+          cat > "out/README_${MODEL}_${DATASET}.txt" << EOF
+          preset  : ${MODEL}
+          dataset : ${DATASET}
+          format  : llama2.c v1 float32 little-endian .bin
+          compat  : karpathy/llama2.c  aarossig/ullm  WiiLM  ullm.js
+
+          # llama2.c run.c
+          gcc -O3 -o run run.c -lm
+          ./run out/${OUT_NAME}
+
+          # aarossig/ullm
+          ./ullm ${OUT_NAME}
+
+          # ullm.js (browser / Node)
+          const ullm = new Ullm();
+          await ullm.loadFromUrls('${OUT_NAME}', 'tokenizer.bin');
+          for await (const tok of ullm.generate('Task: explain_code\nInput: '))
+            process.stdout.write(tok);
+          EOF
+
+
+      # ------------------------------------------------------------------
+      # 9. Upload artifact
+      # ------------------------------------------------------------------
       - name: Commit model outputs
         run: |
           git config user.name "github-actions[bot]"
