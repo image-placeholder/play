@@ -214,12 +214,11 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "Files before add:"
-          ls -lh llama2.c/out/
-          # FORCE add actual outputs only
-          git add -f llama2.c/out/model*.bin || true
-          git add -f llama2.c/out/ckpt.pt || true
-          echo "Git status after add:"
+          echo "Copying outputs out of nested repo..."
+          mkdir -p model_out
+          cp llama2.c/out/*.bin model_out/
+          cp llama2.c/out/ckpt.pt model_out/
+          git add model_out/
           git status
           if ! git diff --cached --quiet; then
             git commit -m "Add trained model"
