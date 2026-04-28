@@ -214,14 +214,16 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "Files in output:"
+          echo "Files before add:"
           ls -lh llama2.c/out/
-          # Only add model outputs (NOT dataset)
-          git add -f llama2.c/out/*.bin
+          # FORCE add actual outputs only
+          git add -f llama2.c/out/model*.bin || true
+          git add -f llama2.c/out/ckpt.pt || true
+          echo "Git status after add:"
           git status
           if ! git diff --cached --quiet; then
-            git commit -m "Add trained model: ${{ github.event.inputs.model }}"
+            git commit -m "Add trained model"
             git push origin HEAD:${{ github.ref_name }}
           else
-            echo "No changes to commit"
+            echo "No changes staged"
           fi
