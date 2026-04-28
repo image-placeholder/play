@@ -5,28 +5,16 @@ Builds a pretokenized explain_code dataset from HuggingFace in the exact
 .bin shard format that karpathy/llama2.c's train.py expects.
 
 Sources (selectable via --source flag):
-  csn         roneneldan/TinyStories  (code_search_net Python — default)
-  code_alpaca sahil2801/CodeAlpaca-20k
-  mbpp        google-research-datasets/mbpp
+  csn           code_search_net Python
+  code_alpaca   sahil2801/CodeAlpaca-20k (Updated to include instructions)
+  mbpp          google-research-datasets/mbpp
 
 Each example is serialised as:
     Task: explain_code
+    Instruction: <instruction>
     Input: <code>
-    Output: <plain-English explanation>
+    Output: <explanation/result>
     <EOS>
-
-Shard format  : raw uint16 token ids (little-endian), no header.
-                Identical to what tinystories.py pretokenize produces.
-Tokenizer     : llama2 SentencePiece (vocab_size=32000).
-                Requires tokenizer.model in llama2.c/ or set TOKENIZER_PATH.
-
-Usage:
-    pip install datasets transformers sentencepiece tqdm numpy
-    python scripts/build_explain_code_dataset.py \
-        --source csn \
-        --out_dir llama2.c/data/explain_code \
-        --tokenizer llama2.c/tokenizer.model \
-        --max_examples 50000
 """
 
 import argparse, json, os, pathlib, struct, sys
@@ -45,7 +33,6 @@ def load_tokenizer(tok_path: str):
         sp.Load(str(tok_path))
         return lambda text: sp.encode(text, out_type=int)
     else:
-        # Fall back to HF llama tokenizer (no local file needed)
         print(f"tokenizer.model not found at {tok_path}, using HF mirror …")
         from transformers import LlamaTokenizer
         tok = LlamaTokenizer.from_pretrained(
@@ -53,7 +40,7 @@ def load_tokenizer(tok_path: str):
         return lambda text: tok.encode(text, add_special_tokens=False)
 
 
-# ── Dataset loaders — each yields (code_str, explanation_str) ───────────────
+# ── Dataset loaders — each yields (instruction, code_str, explanation_str) ───
 
 def _iter_csn(max_examples):
     """code_search_net Python split."""
@@ -70,21 +57,25 @@ def _iter_csn(max_examples):
         summary = doc.split("\n")[0].split(".")[0].strip() if doc else ""
         if len(summary) < 8:
             summary = doc[:150].strip() if doc else "No description."
-        yield code[:800], summary
+        # CSN doesn't have a separate instruction, so we use a generic one
+        yield "Explain the following Python code.", code[:800], summary
 
 
 def _iter_code_alpaca(max_examples):
-    """sahil2801/CodeAlpaca-20k — instruction/output pairs."""
+    """sahil2801/CodeAlpaca-20k — instruction/input/output triplets."""
     from datasets import load_dataset
     ds = load_dataset("sahil2801/CodeAlpaca-20k", split="train")
     for i, ex in enumerate(ds):
         if max_examples and i >= max_examples:
             break
-        code   = (ex.get("output") or "").strip()
-        prompt = (ex.get("instruction") or "").strip()
-        if not code or not prompt:
+        instruction = (ex.get("instruction") or "").strip()
+        context = (ex.get("input") or "").strip()
+        response = (ex.get("output") or "").strip()
+        
+        if not instruction or not response:
             continue
-        yield code[:800], prompt[:300]
+        
+        yield instruction, context[:800], response[:800]
 
 
 def _iter_mbpp(max_examples):
@@ -99,7 +90,8 @@ def _iter_mbpp(max_examples):
         text = (ex.get("text") or "").strip()
         if not code or not text:
             continue
-        yield code[:800], text[:300]
+        # MBPP 'text' is the instruction; we leave Input empty as it's built into code
+        yield text, "", code[:800]
 
 
 SOURCES = {
@@ -113,7 +105,7 @@ SOURCES = {
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--source", default="csn",
+    ap.add_argument("--source", default="code_alpaca",
                     choices=list(SOURCES.keys()),
                     help="HuggingFace dataset source")
     ap.add_argument("--out_dir", default="llama2.c/data/explain_code",
@@ -151,12 +143,15 @@ def main():
 
     print(f"Building explain_code dataset  source={args.source}  out={out_dir}")
 
-    for code, explanation in tqdm(iter_fn(max_ex)):
+    for instruction, input_data, output in tqdm(iter_fn(max_ex)):
+        # Construct the full prompt including the instruction field
         text = (
             f"Task: explain_code\n"
-            f"Input: {code}\n"
-            f"Output: {explanation}"
+            f"Instruction: {instruction}\n"
+            f"Input: {input_data}\n"
+            f"Output: {output}"
         )
+        
         try:
             ids = encode(text)
         except Exception as e:
@@ -183,12 +178,12 @@ def main():
         "vocab_size":    32000,
         "vocab_source":  "llama2",
         "format":        "uint16 token ids, BOS-prefixed, EOS-terminated",
-        "prompt_format": "Task: explain_code\nInput: <code>\nOutput: <explanation>",
+        "prompt_format": "Task: explain_code\nInstruction: <instr>\nInput: <in>\nOutput: <out>",
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
     print(f"\n✓  {n_examples:,} examples  {total_toks:,} tokens  {shard_idx} shards")
-    print(f"   Metadata: {out_dir / 'meta.json'}")
+    print(f"    Metadata: {out_dir / 'meta.json'}")
 
 
 if __name__ == "__main__":
