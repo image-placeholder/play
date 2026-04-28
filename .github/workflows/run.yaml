@@ -41,25 +41,16 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "numpy<2"
-          pip install "torch>=2.4.0" --index-url https://download.pytorch.org/whl/cpu
-          pip install sentencepiece tqdm requests "datasets>=2.19" "transformers>=4.40"
+          pip install "numpy<2" "torch>=2.4.0" sentencepiece tqdm requests "datasets>=2.19" "transformers>=4.40" --index-url https://download.pytorch.org/whl/cpu
 
       - name: Clone karpathy/llama2.c
         run: |
           git clone --depth 1 https://github.com/karpathy/llama2.c.git
-          echo "llama2.c @ $(git -C llama2.c rev-parse --short HEAD)"
-
-      - name: Cache explain_code dataset
-        if: github.event.inputs.dataset == 'explain_code'
-        uses: actions/cache@v4
-        with:
-          path: llama2.c/data/TinyStories_all_data
-          key: explain-code-pretok-v4
 
       - name: Build + pretokenize explain_code dataset
         if: github.event.inputs.dataset == 'explain_code'
         run: |
+          # Use your script to build data
           python scripts/build_explain_code_dataset.py \
             --source code_alpaca \
             --tokenizer llama2.c/tokenizer.model \
@@ -75,12 +66,11 @@ jobs:
           iters_input = int(os.environ.get("ITERS", "0"))
           resume = os.environ.get("RESUME", "false").lower() == "true"
 
-          # PRESETS optimized for Logic and Parameter Budget
-          # micro is now ~15.2M Params: (32000*160) + 12*(12*160^2)
+          # micro: (32000*128) + 12*(12*128^2) ≈ 15M Params
           PRESETS = {
-              "nano":  dict(dim=96,  n_layers=8,  n_heads=6, n_kv_heads=2, hidden_dim=192, seq_len=256, bs=32, ga=1, lr=8e-4, iters=1000, eval=100, warm=100),
-              "micro": dict(dim=160, n_layers=12, n_heads=8, n_kv_heads=4, hidden_dim=320, seq_len=384, bs=32, ga=2, lr=4e-4, iters=2000, eval=200, warm=200),
-              "mini":  dict(dim=288, n_layers=12, n_heads=12, n_kv_heads=6, hidden_dim=768, seq_len=512, bs=16, ga=4, lr=3e-4, iters=3000, eval=250, warm=200),
+              "nano":  dict(dim=96,  n_layers=6,  n_heads=6, n_kv_heads=2, hidden_dim=192, seq_len=256, bs=32, ga=1, lr=8e-4, iters=1000, eval=100, warm=100),
+              "micro": dict(dim=128, n_layers=12, n_heads=8, n_kv_heads=4, hidden_dim=256, seq_len=256, bs=32, ga=2, lr=4e-4, iters=2000, eval=200, warm=200),
+              "mini":  dict(dim=288, n_layers=12, n_heads=12, n_kv_heads=6, hidden_dim=768, seq_len=384, bs=16, ga=4, lr=3e-4, iters=3000, eval=250, warm=200),
           }
           
           p = PRESETS.get(model, PRESETS["micro"])
@@ -104,6 +94,10 @@ jobs:
           grad_clip = 1.0
           eval_interval = {max(1, min(p["eval"], max_iters))}
           log_interval = 10
+          eval_iters = 20
+          eval_only = False
+          always_save_checkpoint = True
+          out_dir = "out"
           init_from = "{'resume' if resume else 'scratch'}"
           dataset = "data"
           vocab_source = "llama2"
@@ -119,48 +113,13 @@ jobs:
           ITERS: ${{ github.event.inputs.iters }}
           RESUME: ${{ github.event.inputs.resume }}
 
-      - name: Train with Loss Watchdog
+      - name: Train model
         run: |
           cd llama2.c
-          # Start training in background
-          # Use stdbuf to ensure logs aren't buffered so the watchdog sees them immediately
-          stdbuf -oL python train.py train_config.py > train.log 2>&1 &
-          TRAIN_PID=$!
-          
-          echo "Training started (PID: $TRAIN_PID). Monitoring loss..."
-          
-          # Watchdog loop
-          for i in {1..360}; do
-            sleep 30 # Check every 30s for faster feedback
-            
-            # If the process is dead, check if it failed
-            if ! kill -0 $TRAIN_PID 2>/dev/null; then
-              wait $TRAIN_PID
-              EXIT_STATUS=$?
-              if [ $EXIT_STATUS -ne 0 ]; then
-                echo "❌ Training crashed with Exit Code $EXIT_STATUS. Printing logs:"
-                cat train.log
-                exit 1
-              fi
-              echo "✅ Training finished naturally."
-              exit 0
-            fi
-            
-            # Monitor Loss
-            CURRENT_LOSS=$(grep -oP 'loss \K[0-9.]+' train.log | tail -1)
-            CURRENT_ITER=$(grep -oP 'step \K[0-9]+' train.log | tail -1)
-            
-            if [ ! -z "$CURRENT_LOSS" ]; then
-              echo "Step $CURRENT_ITER: Loss $CURRENT_LOSS"
-              if [ "$CURRENT_ITER" -gt 200 ] && [ $(echo "$CURRENT_LOSS > 4.8" | bc -l) -eq 1 ]; then
-                echo "FAILSAFE: Loss too high ($CURRENT_LOSS). Terminating."
-                kill $TRAIN_PID
-                exit 1
-              fi
-            fi
-          done
+          # Running in foreground so we see the error if it crashes
+          python train.py train_config.py
 
-      - name: Export checkpoint
+      - name: Export and Commit
         if: success()
         run: |
           cd llama2.c
@@ -168,14 +127,11 @@ jobs:
           DATASET="${{ github.event.inputs.dataset }}"
           OUT_NAME="model_${MODEL}_${DATASET}.bin"
           python export.py "out/${OUT_NAME}" --version 1 --checkpoint "out/ckpt.pt"
-
-      - name: Commit model outputs
-        if: success()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          cd ..
           mkdir -p model_out
           cp llama2.c/out/*.bin model_out/
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add model_out/
-          git commit -m "Add trained model - ${{ github.event.inputs.model }}" || echo "No changes"
+          git commit -m "Add trained model"
           git push origin HEAD:${{ github.ref_name }}
