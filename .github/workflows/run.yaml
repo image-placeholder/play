@@ -192,7 +192,7 @@ jobs:
               grad_clip                   = 1.0
               beta1                       = 0.9
               beta2                       = 0.95
-              eval_interval           = {p["eval"]}
+              eval_interval           = {min(p["eval"], max_iters // 2)}
               log_interval            = 10
               eval_iters              = 20
               eval_only               = False
@@ -219,16 +219,35 @@ jobs:
       - name: Export checkpoint to .bin
         run: |
           cd llama2.c
-          ls -lh out/
-          python export.py out/model.bin --version 1 --checkpoint out/ckpt.pt
+
+          echo "=== Searching for checkpoints ==="
+          find . -name "*.pt" -o -name "*.pth" 2>/dev/null | sort
+          echo "=== Contents of out/ ==="
+          ls -lh out/ 2>/dev/null || echo "out/ does not exist"
+
+          # Find the checkpoint — train.py writes out/ckpt.pt but let's be safe
+          CKPT=""
+          for candidate in out/ckpt.pt out/model.pt ckpt.pt; do
+            if [ -f "$candidate" ]; then
+              CKPT="$candidate"
+              echo "Found checkpoint: $CKPT"
+              break
+            fi
+          done
+
+          if [ -z "$CKPT" ]; then
+            echo "ERROR: No checkpoint found. Training may have failed or not saved."
+            exit 1
+          fi
+
+          python export.py out/model.bin --version 1 --checkpoint "$CKPT"
+
           MODEL="${{ github.event.inputs.model }}"
           DATASET="${{ github.event.inputs.dataset }}"
           mv out/model.bin "out/model_${MODEL}_${DATASET}.bin"
           ls -lh out/
+
           
-      # ------------------------------------------------------------------
-      # 9. Upload artifact
-      # ------------------------------------------------------------------
       - name: Commit model outputs
         run: |
           git config user.name "github-actions[bot]"
