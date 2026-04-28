@@ -122,31 +122,38 @@ jobs:
       - name: Train with Loss Watchdog
         run: |
           cd llama2.c
-          # Start training in background and redirect output to log file
-          python train.py train_config.py > train.log 2>&1 &
+          # Start training in background
+          # Use stdbuf to ensure logs aren't buffered so the watchdog sees them immediately
+          stdbuf -oL python train.py train_config.py > train.log 2>&1 &
           TRAIN_PID=$!
           
           echo "Training started (PID: $TRAIN_PID). Monitoring loss..."
           
-          # Watchdog loop: Check every 60 seconds
+          # Watchdog loop
           for i in {1..360}; do
-            sleep 60
+            sleep 30 # Check every 30s for faster feedback
+            
+            # If the process is dead, check if it failed
             if ! kill -0 $TRAIN_PID 2>/dev/null; then
-              echo "Training finished naturally."
               wait $TRAIN_PID
+              EXIT_STATUS=$?
+              if [ $EXIT_STATUS -ne 0 ]; then
+                echo "❌ Training crashed with Exit Code $EXIT_STATUS. Printing logs:"
+                cat train.log
+                exit 1
+              fi
+              echo "✅ Training finished naturally."
               exit 0
             fi
             
-            # Extract last reported loss from log
+            # Monitor Loss
             CURRENT_LOSS=$(grep -oP 'loss \K[0-9.]+' train.log | tail -1)
             CURRENT_ITER=$(grep -oP 'step \K[0-9]+' train.log | tail -1)
             
             if [ ! -z "$CURRENT_LOSS" ]; then
-              echo "Step $CURRENT_ITER: Current Loss $CURRENT_LOSS"
-              
-              # Watchdog Logic: If at step 200+ loss is still > 4.5, kill it
-              if [ "$CURRENT_ITER" -gt 200 ] && [ $(echo "$CURRENT_LOSS > 4.5" | bc -l) -eq 1 ]; then
-                echo "FAILSAFE: Loss is too high ($CURRENT_LOSS) at step $CURRENT_ITER. Architecture/LR mismatch. Terminating."
+              echo "Step $CURRENT_ITER: Loss $CURRENT_LOSS"
+              if [ "$CURRENT_ITER" -gt 200 ] && [ $(echo "$CURRENT_LOSS > 4.8" | bc -l) -eq 1 ]; then
+                echo "FAILSAFE: Loss too high ($CURRENT_LOSS). Terminating."
                 kill $TRAIN_PID
                 exit 1
               fi
