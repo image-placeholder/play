@@ -214,12 +214,9 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout ${{ github.ref_name }}
-          git add out/*.bin || true
-          git add out/*.pt || true
-          git add -f llama2.c/out/*.bin || true
-          git add -f llama2.c/out/*.pt || true
-          git add -f /*.bin || true
+          echo "DEBUG: locating .bin files"
+          find . -name "*.bin"
+          git add -f $(find . -name "*.bin") || true
           if ! git diff --cached --quiet; then
             git commit -m "Add trained model: ${{ github.event.inputs.model }}"
             git push
