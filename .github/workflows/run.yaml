@@ -308,8 +308,8 @@ jobs:
           DATASET="${{ github.event.inputs.dataset }}"
           OUT_NAME="model_${MODEL}_${DATASET}.bin"
 
-          # Use --checkpoint because we are exporting the local result of train.py
-          python export.py "out/${OUT_NAME}" --version 1 --checkpoint out/ckpt.pt
+          python export.py out/ckpt.pt --version 1
+          mv out/model.bin "out/${OUT_NAME}"
 
           echo "── Exported artifact ──────────────────────────────────────"
           ls -lh out/
@@ -333,7 +333,6 @@ jobs:
           for await (const tok of ullm.generate('Task: explain_code\nInput: '))
             process.stdout.write(tok);
           EOF
-
 
       # ------------------------------------------------------------------
       # 9. Upload artifact
