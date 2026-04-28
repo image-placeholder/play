@@ -217,6 +217,9 @@ jobs:
           git checkout ${{ github.ref_name }}
           git add out/*.bin || true
           git add out/*.pt || true
+          git add -f llama2.c/out/*.bin || true
+          git add -f llama2.c/out/*.pt || true
+          git add -f /*.bin || true
           if ! git diff --cached --quiet; then
             git commit -m "Add trained model: ${{ github.event.inputs.model }}"
             git push
