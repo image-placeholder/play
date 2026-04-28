@@ -215,10 +215,11 @@ jobs:
           PYEOF
 
       # ── 4. Write train_config.py ────────────────────────────────────────
+ 
       - name: Write train_config.py
         run: |
           python - << 'PYEOF'
-          import os, pathlib
+          import os, pathlib, textwrap
 
           model   = os.environ["MODEL"]
           dataset = os.environ["DATASET"]
@@ -239,8 +240,9 @@ jobs:
           p = PRESETS.get(model, PRESETS["micro"])
           max_iters = iters if iters > 0 else p["iters"]
 
-          # tinystories.py Task always looks under DATA_CACHE_DIR/TinyStories_all_data
-          # for vocab_source=llama2, so dataset config value is just "data"
+          # eval_interval must be <= max_iters so at least one checkpoint is saved
+          eval_interval = min(p["eval"], max_iters)
+
           cfg = f"""\
           # model={model}  dataset={dataset}  iters={max_iters}
           dim            = {p["dim"]}
@@ -254,7 +256,7 @@ jobs:
           batch_size                  = {p["bs"]}
           gradient_accumulation_steps = {p["ga"]}
           learning_rate               = {p["lr"]}
-          warmup_iters                = {p["warm"]}
+          warmup_iters                = {min(p["warm"], max_iters)}
           lr_decay_iters              = {max_iters}
           min_lr                      = {p["lr"] * 0.1}
           weight_decay                = 0.1
@@ -262,7 +264,7 @@ jobs:
           beta1                       = 0.9
           beta2                       = 0.95
 
-          eval_interval           = {p["eval"]}
+          eval_interval           = {eval_interval}
           log_interval            = 10
           eval_iters              = 20
           eval_only               = False
@@ -279,13 +281,12 @@ jobs:
           dtype   = "float32"
           compile = False
           """
-          # de-indent (heredoc adds leading spaces)
-          import textwrap
           cfg = textwrap.dedent(cfg)
 
           out = pathlib.Path("llama2.c/train_config.py")
           out.write_text(cfg)
           print(f"Config written → {out}")
+          print(f"max_iters={max_iters}  eval_interval={eval_interval}")
           print(cfg)
           PYEOF
         env:
