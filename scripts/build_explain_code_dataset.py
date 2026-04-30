@@ -159,7 +159,7 @@ def main():
 
     print(f"Building explain_code dataset  source={args.source}  out={out_dir}")
 
-      for instruction, input_data, output in tqdm(iter_fn(max_ex)):
+    for instruction, input_data, output in tqdm(iter_fn(max_ex)):
         # 1. Construct parts. Use input_data if it exists, otherwise just the instruction.
         # This keeps the format consistent for a 15M model.
         full_instruction = f"{instruction}\nInput: {input_data}" if input_data else instruction
