@@ -75,8 +75,23 @@ def _iter_code_alpaca(max_examples):
         if not instruction or not response:
             continue
         
-        yield instruction, context[:800], response[:800]
+        yield instruction, context, response
 
+
+def _iter_self_instruct(max_examples):
+    """bigcode/self-oss-instruct-sc2-exec-filter-50k"""
+    from datasets import load_dataset
+    ds = load_dataset("bigcode/self-oss-instruct-sc2-exec-filter-50k", split="train")
+    for i, ex in enumerate(ds):
+        if max_examples and i >= max_examples:
+            break
+        instruction = (ex.get("instruction") or "").strip()
+        response = (ex.get("response") or "").strip()
+        
+        if not instruction or not response:
+            continue
+        
+        yield instruction, "", response
 
 def _iter_mbpp(max_examples):
     """google-research-datasets/mbpp — task description + Python solution."""
@@ -91,13 +106,14 @@ def _iter_mbpp(max_examples):
         if not code or not text:
             continue
         # MBPP 'text' is the instruction; we leave Input empty as it's built into code
-        yield text, "", code[:800]
+        yield text, "", code
 
 
 SOURCES = {
     "csn":         _iter_csn,
     "code_alpaca": _iter_code_alpaca,
     "mbpp":        _iter_mbpp,
+    "self_instruct": _iter_self_instruct
 }
 
 
@@ -105,7 +121,7 @@ SOURCES = {
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--source", default="code_alpaca",
+    ap.add_argument("--source", default="self_instruct",
                     choices=list(SOURCES.keys()),
                     help="HuggingFace dataset source")
     ap.add_argument("--out_dir", default="llama2.c/data/explain_code",
@@ -143,32 +159,45 @@ def main():
 
     print(f"Building explain_code dataset  source={args.source}  out={out_dir}")
 
-    for instruction, input_data, output in tqdm(iter_fn(max_ex)):
-        # Construct the full prompt including the instruction field
-        text = (
-            f"Task: explain_code\n"
-            f"Instruction: {instruction}\n"
-            f"Input: {input_data}\n"
-            f"Output: {output}"
-        )
+      for instruction, input_data, output in tqdm(iter_fn(max_ex)):
+        # 1. Construct parts. Use input_data if it exists, otherwise just the instruction.
+        # This keeps the format consistent for a 15M model.
+        full_instruction = f"{instruction}\nInput: {input_data}" if input_data else instruction
+        
+        instruction_part = f"I: {full_instruction}\nO: "
+        output_part = f"{output}"
         
         try:
-            ids = encode(text)
+            # 2. Encode pieces separately
+            # We encode them individually so we don't accidentally double-BOS
+            encoded_prompt = encode(instruction_part)
+            encoded_output = encode(output_part)
+            
+            # 3. Assemble: [BOS] + Prompt + Output + [EOS]
+            seq = [BOS] + encoded_prompt + encoded_output + [EOS]
+            
+            # 4. Truncate if it exceeds max_seq_len
+            # We save 1 slot for the EOS token to ensure the model learns to stop
+            if len(seq) > args.max_seq_len:
+                seq = seq[:args.max_seq_len - 1] + [EOS]
+                
         except Exception as e:
-            print(f"  Tokenisation error (skipping): {e}")
+            print(f"  Tokenization error (skipping): {e}")
             continue
 
-        seq = [BOS] + list(ids[:args.max_seq_len]) + [EOS]
+        # 5. Record keeping and shard management
         shard_toks.extend(seq)
         total_toks += len(seq)
         n_examples += 1
 
+        # 6. Periodic flush to .bin file
         if len(shard_toks) >= args.shard_size:
-            shard_idx  = flush(shard_toks, shard_idx)
+            shard_idx = flush(shard_toks, shard_idx)
             shard_toks = []
 
+    # Final flush for the remaining tokens
     if shard_toks:
-        shard_idx = flush(shard_toks, shard_idx)
+        shard_idx = flush(shard_toks, shard_idx) 
 
     meta = {
         "source":        args.source,
