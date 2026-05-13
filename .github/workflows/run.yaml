@@ -12,7 +12,7 @@ on:
 
       dataset:
         description: "Dataset: tinystories | explain_code"
-        default: "tinystories"
+        default: "code_alpaca"
         required: true
         type: choice
         options: [tinystories, explain_code]
