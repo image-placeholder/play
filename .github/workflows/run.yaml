@@ -9,22 +9,26 @@ on:
         required: true
         type: choice
         options: [nano, micro, mini]
+
       dataset:
         description: "Dataset: tinystories | explain_code"
         default: "tinystories"
         required: true
         type: choice
         options: [tinystories, explain_code]
+
       iters:
         description: "Training iterations (0 = use preset default)"
         default: "0"
+
       resume:
         description: "Resume from checkpoint?"
         default: "false"
         type: choice
         options: ["false", "true"]
+
       early_stop:
-        description: "Early stopping patience (evals with no improvement, 0 = disabled)"
+        description: "Early stopping patience (0 = disabled)"
         default: "3"
 
 jobs:
@@ -41,288 +45,167 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install Python dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install "numpy<2"
           pip install "torch>=2.4.0" --index-url https://download.pytorch.org/whl/cpu
           pip install sentencepiece tqdm requests "datasets>=2.19" "transformers>=4.40"
 
-      - name: Clone karpathy/llama2.c
+      # ─────────────────────────────────────────────────────────────
+      # DATA PREP (runs inside llama2.c as dependency only)
+      # ─────────────────────────────────────────────────────────────
+
+      - name: Clone llama2.c (for dataset tooling only)
         run: |
           git clone --depth 1 https://github.com/karpathy/llama2.c.git
-          echo "llama2.c @ $(git -C llama2.c rev-parse --short HEAD)"
 
-      - name: Cache TinyStories dataset
-        if: github.event.inputs.dataset == 'tinystories'
+      - name: Cache datasets
         uses: actions/cache@v4
         with:
           path: llama2.c/data
-          key: tinystories-pretok-v1
+          key: llama2-data-cache-v1
 
-      - name: Download + pretokenize TinyStories
+      - name: Prepare TinyStories dataset
         if: github.event.inputs.dataset == 'tinystories'
         run: |
           cd llama2.c
           if [ ! -d "data/TinyStories_all_data" ]; then
             python tinystories.py download
-          fi
-          if [ ! -f "data/TinyStories_all_data/data00.bin" ]; then
             python tinystories.py pretokenize
           fi
 
-      - name: Cache explain_code dataset
-        if: github.event.inputs.dataset == 'explain_code'
-        uses: actions/cache@v4
-        with:
-          path: llama2.c/data/TinyStories_all_data
-          key: explain-code-pretok-v4
-
-      - name: Build + pretokenize explain_code dataset
+      - name: Prepare explain_code dataset
         if: github.event.inputs.dataset == 'explain_code'
         run: |
-          # Skip if cache already populated
-          if ls llama2.c/data/TinyStories_all_data/data*.bin 2>/dev/null; then
-            echo "Cache hit — skipping build."
-          else
-            # Ensure tokenizer.model is present for the script
-            if [ ! -f "llama2.c/tokenizer.model" ]; then
-              curl -sL "https://huggingface.co/hf-internal-testing/llama-tokenizer/resolve/main/tokenizer.model" \
-                -o llama2.c/tokenizer.model
-            fi
-            python scripts/build_explain_code_dataset.py \
-              --source      csn \
-              --out_dir     llama2.c/data/TinyStories_all_data \
-              --tokenizer   llama2.c/tokenizer.model \
-              --max_seq_len 512
+          mkdir -p data/explain_code
+
+          if [ ! -f "llama2.c/tokenizer.model" ]; then
+            curl -sL \
+              https://huggingface.co/hf-internal-testing/llama-tokenizer/resolve/main/tokenizer.model \
+              -o llama2.c/tokenizer.model
           fi
+
+          python scripts/build_explain_code_dataset.py \
+            --source self_instruct \
+            --out_dir llama2.c/data/explain_code \
+            --tokenizer llama2.c/tokenizer.model \
+            --max_seq_len 256
+
+      # ─────────────────────────────────────────────────────────────
+      # CONFIG GENERATION
+      # ─────────────────────────────────────────────────────────────
 
       - name: Write train_config.py
         run: |
           python - << 'PYEOF'
           import os, pathlib, textwrap
 
-          model       = os.environ["MODEL"]
-          iters_input = int(os.environ.get("ITERS", "0"))
-          resume      = os.environ.get("RESUME", "false").lower() == "true"
+          model = os.environ["MODEL"]
+          iters = int(os.environ.get("ITERS", "0"))
+          resume = os.environ.get("RESUME", "false") == "true"
 
           PRESETS = {
-              "nano":  dict(dim=64,  n_layers=4, n_heads=4, n_kv_heads=4, hidden_dim=128, seq_len=256, bs=32, ga=1, lr=8e-4, iters=300,  eval=100, warm=50),
-              "micro": dict(dim=128, n_layers=5, n_heads=4, n_kv_heads=4, hidden_dim=256, seq_len=256, bs=32, ga=2, lr=5e-4, iters=600,  eval=200, warm=100),
-              "mini":  dict(dim=288, n_layers=6, n_heads=6, n_kv_heads=6, hidden_dim=768, seq_len=256, bs=16, ga=4, lr=3e-4, iters=1000, eval=250, warm=100),
+              "nano":  dict(dim=64,  layers=4, heads=4, kv=4, seq=256, bs=32, ga=1, lr=8e-4, iters=300),
+              "micro": dict(dim=128, layers=5, heads=4, kv=4, seq=256, bs=32, ga=2, lr=5e-4, iters=600),
+              "mini":  dict(dim=288, layers=6, heads=6, kv=6, seq=256, bs=16, ga=4, lr=3e-4, iters=1000),
           }
-          p         = PRESETS.get(model, PRESETS["micro"])
-          max_iters = iters_input if iters_input > 0 else p["iters"]
 
-          warmup_iters   = min(p["warm"], max_iters // 2) if max_iters > 1 else 0
-          lr_decay_iters = max_iters + 1
-          eval_interval  = max(1, min(p["eval"], max_iters))
+          p = PRESETS[model]
+          max_iters = iters if iters > 0 else p["iters"]
 
-          cfg = f"""\
+          cfg = f"""
           dim = {p["dim"]}
-          n_layers = {p["n_layers"]}
-          n_heads = {p["n_heads"]}
-          n_kv_heads = {p["n_kv_heads"]}
-          multiple_of = 32
-          max_seq_len = {p["seq_len"]}
-          max_iters = {max_iters}
+          n_layers = {p["layers"]}
+          n_heads = {p["heads"]}
+          n_kv_heads = {p["kv"]}
+          max_seq_len = {p["seq"]}
           batch_size = {p["bs"]}
           gradient_accumulation_steps = {p["ga"]}
           learning_rate = {p["lr"]}
-          warmup_iters = {warmup_iters}
-          lr_decay_iters = {lr_decay_iters}
+          max_iters = {max_iters}
+          warmup_iters = {max_iters // 20}
+          lr_decay_iters = {max_iters}
           min_lr = {p["lr"] * 0.1}
           weight_decay = 0.1
           grad_clip = 1.0
-          beta1 = 0.9
-          beta2 = 0.95
-          eval_interval = {eval_interval}
+          
+          eval_interval = 200
           log_interval = 10
           eval_iters = 20
-          eval_only = False
-          always_save_checkpoint = True
+          
           out_dir = "out"
+          dataset = "data/explain_code" if "{os.environ.get('DATASET','tinystories')}" == "explain_code" else "data"
           init_from = "{'resume' if resume else 'scratch'}"
-          dataset = "data"
-          vocab_source = "llama2"
+          
           vocab_size = 32000
+          vocab_source = "llama2"
           device = "cpu"
           dtype = "float32"
           compile = False
           """
-          pathlib.Path("llama2.c/train_config.py").write_text(textwrap.dedent(cfg))
+          pathlib.Path("train_config.py").write_text(cfg)
           PYEOF
         env:
-          MODEL:  ${{ github.event.inputs.model }}
-          ITERS:  ${{ github.event.inputs.iters }}
+          MODEL: ${{ github.event.inputs.model }}
+          ITERS: ${{ github.event.inputs.iters }}
           RESUME: ${{ github.event.inputs.resume }}
+          DATASET: ${{ github.event.inputs.dataset }}
 
-      # ---------------------------------------------------------------------------
-      # Write the early-stopping watcher alongside train.py so it can tail the log
-      # ---------------------------------------------------------------------------
-      - name: Write early_stop_watcher.py
-        if: ${{ github.event.inputs.early_stop != '0' }}
-        run: |
-          cat > llama2.c/early_stop_watcher.py << 'PYEOF'
-          """
-          Tails train_log.txt written by the patched train.py wrapper.
-          Kills the training process if val loss stops improving for
-          `patience` consecutive eval checkpoints, or if loss is NaN/Inf.
-          Writes EARLY_STOP=true to $GITHUB_OUTPUT on exit so the next
-          step can surface a clear failure message.
-          """
-          import sys, os, time, math, signal, pathlib
+      # ─────────────────────────────────────────────────────────────
+      # TRAINING (UPDATED: uses scripts/train.py)
+      # ─────────────────────────────────────────────────────────────
 
-          LOG_FILE  = pathlib.Path("train_log.txt")
-          PATIENCE  = int(sys.argv[1]) if len(sys.argv) > 1 else 3
-          POLL_SECS = 5
-          # Ignore the very first eval (model is still in warmup)
-          WARMUP_EVALS = 1
-
-          best_val   = math.inf
-          no_improve = 0
-          evals_seen = 0
-          train_pid  = int(sys.argv[2]) if len(sys.argv) > 2 else None
-
-          def emit_output(stopped: bool, reason: str = ""):
-              gho = os.environ.get("GITHUB_OUTPUT", "")
-              if gho:
-                  with open(gho, "a") as f:
-                      f.write(f"early_stopped={'true' if stopped else 'false'}\n")
-                      if reason:
-                          f.write(f"stop_reason={reason}\n")
-
-          print(f"[watcher] started — patience={PATIENCE}, train_pid={train_pid}", flush=True)
-
-          seen_lines = 0
-          while True:
-              time.sleep(POLL_SECS)
-
-              if not LOG_FILE.exists():
-                  # Training hasn't produced any output yet
-                  continue
-
-              lines = LOG_FILE.read_text().splitlines()
-              new_lines = lines[seen_lines:]
-              seen_lines = len(lines)
-
-              for line in new_lines:
-                  print(f"[train] {line}", flush=True)
-
-                  # Detect NaN / Inf loss — kill immediately
-                  if "nan" in line.lower() or "inf" in line.lower():
-                      print(f"[watcher] ❌ NaN/Inf detected — killing training.", flush=True)
-                      if train_pid:
-                          os.kill(train_pid, signal.SIGTERM)
-                      emit_output(True, "NaN or Inf loss detected")
-                      sys.exit(1)
-
-                  # Parse eval lines: "step NNN: train loss X.XXXX, val loss Y.YYYY"
-                  if "val loss" in line:
-                      try:
-                          val_loss = float(line.split("val loss")[-1].strip().split()[0].rstrip(","))
-                      except (ValueError, IndexError):
-                          continue
-
-                      evals_seen += 1
-                      if evals_seen <= WARMUP_EVALS:
-                          print(f"[watcher] eval {evals_seen} (warmup skip) — val loss {val_loss:.4f}", flush=True)
-                          best_val = min(best_val, val_loss)
-                          continue
-
-                      if val_loss < best_val:
-                          print(f"[watcher] ✅ val loss improved {best_val:.4f} → {val_loss:.4f}", flush=True)
-                          best_val   = val_loss
-                          no_improve = 0
-                      else:
-                          no_improve += 1
-                          print(f"[watcher] ⚠️  no improvement ({no_improve}/{PATIENCE}) — best={best_val:.4f} current={val_loss:.4f}", flush=True)
-                          if no_improve >= PATIENCE:
-                              print(f"[watcher] ❌ patience exhausted — killing training.", flush=True)
-                              if train_pid:
-                                  os.kill(train_pid, signal.SIGTERM)
-                              emit_output(True, f"No val loss improvement for {PATIENCE} consecutive evals (best={best_val:.4f})")
-                              sys.exit(1)
-
-              # Check if training process finished on its own
-              if train_pid:
-                  try:
-                      os.kill(train_pid, 0)   # signal 0 = existence check only
-                  except ProcessLookupError:
-                      print("[watcher] Training process exited — watcher done.", flush=True)
-                      emit_output(False)
-                      sys.exit(0)
-          PYEOF
-
-      # ---------------------------------------------------------------------------
-      # Patch the training entrypoint to tee output into train_log.txt
-      # then launch training + watcher as concurrent processes
-      # ---------------------------------------------------------------------------
-      - name: Train model
+      - name: Train model (scripts/train.py)
         id: train
         run: |
-          cd llama2.c
+          mkdir -p out
 
           if [ "${{ github.event.inputs.early_stop }}" = "0" ]; then
-            # Early stopping disabled — plain run
-            python train.py train_config.py
+            python scripts/train.py train_config.py
           else
-            # Tee train output to a log file the watcher can read
-            python train.py train_config.py 2>&1 | tee train_log.txt &
+            python scripts/train.py train_config.py 2>&1 | tee train_log.txt &
             TRAIN_PID=$!
-            echo "Training PID: $TRAIN_PID"
 
-            # Start the watcher, passing patience and the train PID
-            python early_stop_watcher.py "${{ github.event.inputs.early_stop }}" $TRAIN_PID &
+            python llama2.c/early_stop_watcher.py \
+              "${{ github.event.inputs.early_stop }}" $TRAIN_PID &
+
             WATCHER_PID=$!
 
-            # Wait for whichever finishes first
             wait $TRAIN_PID
             TRAIN_EXIT=$?
-            # Give watcher a moment to flush its final output
+
             sleep 2
             kill $WATCHER_PID 2>/dev/null || true
-            wait $WATCHER_PID 2>/dev/null || true
 
             if [ $TRAIN_EXIT -ne 0 ]; then
-              echo "::error::Training was terminated early by the watcher."
+              echo "::error::Training failed or was stopped."
               exit 1
             fi
           fi
 
-      - name: Report early stop reason
-        if: failure() && steps.train.outputs.early_stopped == 'true'
+      # ─────────────────────────────────────────────────────────────
+      # EXPORT
+      # ─────────────────────────────────────────────────────────────
+
+      - name: Export model
         run: |
-          echo "::error::Early stopping triggered: ${{ steps.train.outputs.stop_reason }}"
+          python scripts/export.py out/model.bin || true
 
-      - name: Export checkpoint to llama2.c v1 .bin
-        run: |
-          cd llama2.c
-          MODEL="${{ github.event.inputs.model }}"
-          DATASET="${{ github.event.inputs.dataset }}"
-          OUT_NAME="model_${MODEL}_${DATASET}.bin"
-          CKPT="out/ckpt.pt"
+      # ─────────────────────────────────────────────────────────────
+      # COMMIT OUTPUTS
+      # ─────────────────────────────────────────────────────────────
 
-          if [ -f "$CKPT" ]; then
-            python export.py "out/${OUT_NAME}" --version 1 --checkpoint "$CKPT"
-            echo "Exported out/${OUT_NAME}"
-          else
-            echo "Training did not produce a checkpoint."
-            exit 1
-          fi
-
-      - name: Commit model outputs
+      - name: Commit outputs
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          echo "Copying outputs out of nested repo..."
+
           mkdir -p model_out
-          cp llama2.c/out/*.bin model_out/
-          git add model_out/
-          git status
+          cp -r out/* model_out/ || true
+
+          git add model_out
           if ! git diff --cached --quiet; then
-            git commit -m "Add trained model"
-            git push origin HEAD:${{ github.ref_name }}
-          else
-            echo "No changes staged"
+            git commit -m "trained model output"
+            git push
           fi
